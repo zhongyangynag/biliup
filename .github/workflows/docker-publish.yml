@@ -1,17 +1,8 @@
 name: Docker
 
+# Disabled auto-build: only run when manually dispatched.
 on:
-  push:
-    # Publish `master` as Docker `latest` image.
-    branches:
-      - master
-
-    # Publish `v1.2.3` tags as releases.
-    tags:
-      - v*
-
-  # Run tests for any PRs.
-  pull_request:
+  workflow_dispatch:
 
 # 顶层只保留读权限：test 任务会在 pull_request 事件下检出并构建
 # PR 代码，不应持有 packages 写权限
