@@ -15,6 +15,7 @@ mod douyin;
 mod douyu;
 mod general;
 mod huya;
+mod huya_wup;
 mod inke;
 mod kilakila;
 mod kuaishou;
@@ -74,6 +75,29 @@ pub trait LivePlugin: Send + Sync {
     fn name(&self) -> &'static str;
     fn matches(&self, url: &str) -> bool;
     async fn check_stream(&self, request: LiveRequest) -> LiveResult<LiveStatus>;
+
+    /// 是否支持批量直播检测。默认 false。
+    /// 支持的平台可用一次请求判定多个直播间的开播状态（对齐 Python `BatchCheck`），
+    /// 监控侧据此先批量过滤，未开播的房间跳过逐间检测。
+    fn supports_batch_check(&self) -> bool {
+        false
+    }
+
+    /// 批量检测：给定同平台的一批 URL，返回其中正在直播的 URL 子集。
+    /// 默认返回空（不支持批量检测的平台不应被调用到）。
+    async fn batch_check(&self, request: BatchCheckRequest) -> LiveResult<Vec<String>> {
+        let _ = request;
+        Ok(Vec::new())
+    }
+}
+
+/// 批量检测请求。承载同平台待检测的 URL 列表与所需的客户端 / 凭据 / 选项。
+#[derive(Debug, Clone)]
+pub struct BatchCheckRequest {
+    pub client: Client,
+    pub urls: Vec<String>,
+    pub options: LiveOptions,
+    pub credentials: LiveCredentials,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +193,7 @@ impl Default for DouyinOptions {
 #[derive(Debug, Clone)]
 pub struct DouyuOptions {
     pub cdn: String,
+    pub force_hs: bool,
     pub rate: u32,
     pub disable_interactive_game: bool,
     pub danmaku: bool,
@@ -178,6 +203,7 @@ impl Default for DouyuOptions {
     fn default() -> Self {
         Self {
             cdn: "hw-h5".to_string(),
+            force_hs: false,
             rate: 0,
             disable_interactive_game: false,
             danmaku: false,
@@ -188,9 +214,11 @@ impl Default for DouyuOptions {
 #[derive(Debug, Clone)]
 pub struct HuyaOptions {
     pub cdn: String,
+    pub cdn_fallback: bool,
     pub max_ratio: u32,
     pub protocol: String,
     pub imgplus: bool,
+    pub mobile_api: bool,
     pub codec: String,
     pub danmaku: bool,
 }
@@ -199,9 +227,11 @@ impl Default for HuyaOptions {
     fn default() -> Self {
         Self {
             cdn: String::new(),
+            cdn_fallback: false,
             max_ratio: 0,
             protocol: "Flv".to_string(),
             imgplus: true,
+            mobile_api: false,
             codec: "264".to_string(),
             danmaku: false,
         }

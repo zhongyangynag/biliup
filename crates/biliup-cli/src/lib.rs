@@ -12,13 +12,13 @@ use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionManager;
 use crate::server::infrastructure::models::live_streamer::InsertLiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::{
-    InsertUploadStreamer, UploadStreamer,
+    InsertUploadStreamer, UploadStreamer, is_noop_uploader,
 };
 use crate::server::infrastructure::repositories;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use clap::ValueEnum;
-use error_stack::{Report, ResultExt};
-use std::net::ToSocketAddrs;
+use error_stack::{Report, ResultExt, bail};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tracing_subscriber::{EnvFilter, Registry, reload};
@@ -34,6 +34,36 @@ pub async fn run(
     log_handle: LogHandle,
     config_path: Option<PathBuf>,
 ) -> AppResult<()> {
+    run_with_cookie(
+        addr,
+        auth,
+        false,
+        log_handle,
+        config_path,
+        PathBuf::from("cookies.json"),
+    )
+    .await
+}
+
+pub async fn run_with_cookie(
+    addr: (&str, u16),
+    auth: bool,
+    secure_session_cookie: bool,
+    log_handle: LogHandle,
+    config_path: Option<PathBuf>,
+    user_cookie: PathBuf,
+) -> AppResult<()> {
+    let addr = addr
+        .to_socket_addrs()
+        .change_context(AppError::Unknown)?
+        .next()
+        .ok_or_else(|| {
+            Report::new(AppError::Custom(
+                "bind address resolved to no sockets".into(),
+            ))
+        })?;
+    validate_server_exposure(addr, auth)?;
+
     // let config = Arc::new(AppConfig::parse());
 
     tracing::info!(
@@ -41,7 +71,16 @@ pub async fn run(
     );
     let conn_pool = ConnectionManager::new_pool("data/data.sqlite3")
         .await
-        .expect("could not initialize the database connection pool");
+        .attach("could not initialize the database connection pool")?;
+
+    if let Some(configuration) =
+        repositories::register_bilibili_cookie(&conn_pool, &user_cookie).await?
+    {
+        tracing::info!(
+            cookie_file = %configuration.value,
+            "registered CLI Bilibili cookie file for Web UI"
+        );
+    }
 
     let loaded_config = if let Some(path) = config_path.as_deref() {
         let config = Config::load(path)?;
@@ -72,14 +111,18 @@ pub async fn run(
     }
 
     tracing::info!("migrations successfully ran, initializing axum server...");
-    let addr = addr
-        .to_socket_addrs()
-        .change_context(AppError::Unknown)?
-        .next()
-        .unwrap();
-    ApplicationController::serve(&addr, auth, service_register)
+    ApplicationController::serve(&addr, auth, secure_session_cookie, service_register)
         .await
         .attach("could not initialize application routes")?;
+    Ok(())
+}
+
+fn validate_server_exposure(addr: SocketAddr, auth: bool) -> AppResult<()> {
+    if !addr.ip().is_loopback() && !auth {
+        bail!(AppError::Custom(format!(
+            "refusing to expose the unauthenticated Web API on {addr}; use a loopback bind address or enable --auth"
+        )));
+    }
     Ok(())
 }
 
@@ -182,10 +225,7 @@ fn to_upload_streamer_insert(
     global_uploader: Option<String>,
 ) -> AppResult<Option<InsertUploadStreamer>> {
     let uploader = streamer.uploader.clone().or(global_uploader);
-    if uploader
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("noop"))
-    {
+    if is_noop_uploader(uploader.as_deref()) {
         return Ok(None);
     }
 
@@ -316,7 +356,46 @@ pub enum UploadLine {
     Cntx,
     Antx,
     Attx,
-    Bda,
     Txa,
     Alia,
+    Estx,
+    Akbd,
+}
+
+#[cfg(test)]
+mod server_exposure_tests {
+    use super::validate_server_exposure;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn unauthenticated_server_is_limited_to_loopback() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert!(validate_server_exposure(SocketAddr::new(ip, 19159), false).is_ok());
+        }
+        assert!(
+            validate_server_exposure(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 19159),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    /// The Web administrator is bootstrapped over the network on first visit, so
+    /// an authenticated server must start on a non-loopback bind even when no
+    /// administrator exists yet — a container or headless host has no way to
+    /// reach a loopback-only bind to initialize one.
+    #[test]
+    fn authenticated_server_can_bind_non_loopback_before_bootstrap() {
+        assert!(
+            validate_server_exposure(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 19159),
+                true,
+            )
+            .is_ok()
+        );
+    }
 }

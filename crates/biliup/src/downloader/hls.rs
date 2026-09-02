@@ -1,14 +1,30 @@
 use crate::downloader::error::{Error, Result};
 use crate::downloader::util::{LifecycleFile, Segmentable};
-use m3u8_rs::Playlist;
+use m3u8_rs::{MediaPlaylist, Playlist};
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::client::StatelessClient;
+
+const MIN_PLAYLIST_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+fn parse_media_playlist(bytes: &[u8]) -> Result<MediaPlaylist> {
+    m3u8_rs::parse_media_playlist(bytes)
+        .map(|(_, playlist)| playlist)
+        .map_err(|error| Error::Custom(format!("Unable to parse media playlist content: {error}")))
+}
+
+fn playlist_poll_interval(playlist: &MediaPlaylist) -> Duration {
+    Duration::from_secs(playlist.target_duration).max(MIN_PLAYLIST_POLL_INTERVAL)
+}
+
+fn playlist_should_refresh(playlist: &MediaPlaylist) -> bool {
+    !playlist.end_list
+}
 
 pub async fn download(
     url: &str,
@@ -27,21 +43,32 @@ pub async fn download(
     let mut pl = match m3u8_rs::parse_playlist(&bytes) {
         Ok((_i, Playlist::MasterPlaylist(pl))) => {
             info!("Master playlist:\n{:#?}", pl);
-            media_url = media_url.join(&pl.variants[0].uri)?;
+            // Pick the highest-bandwidth playable variant. The first variant is not
+            // necessarily the best quality (e.g. Twitch orders transcodes ahead of the
+            // source), so prefer the highest-bandwidth stream that carries a resolution.
+            // Skip I-frame (trick-play) streams, which are not full playable renditions.
+            // Fall back to the highest-bandwidth non-I-frame variant, then the first one.
+            let best = pl
+                .variants
+                .iter()
+                .filter(|v| !v.is_i_frame && v.resolution.is_some())
+                .max_by_key(|v| v.bandwidth)
+                .or_else(|| {
+                    pl.variants
+                        .iter()
+                        .filter(|v| !v.is_i_frame)
+                        .max_by_key(|v| v.bandwidth)
+                })
+                .unwrap_or(&pl.variants[0]);
+            info!(
+                "Selected variant: bandwidth={}, resolution={:?}, video={:?}",
+                best.bandwidth, best.resolution, best.video
+            );
+            media_url = media_url.join(&best.uri)?;
             info!("media url: {media_url}");
             let resp = client.retryable(media_url.as_str()).await?;
             let bs = resp.bytes().await?;
-            // println!("{:?}", bs);
-            match m3u8_rs::parse_media_playlist(&bs) {
-                Ok((_, pl)) => pl,
-                Err(e) => {
-                    let mut file = File::create("test.fmp4")?;
-                    file.write_all(&bs)?;
-                    return Err(Error::Custom(format!(
-                        "Unable to parse media playlist content: {e}"
-                    )));
-                }
-            }
+            parse_media_playlist(&bs)?
         }
         Ok((_i, Playlist::MediaPlaylist(pl))) => {
             info!("Media playlist:\n{:#?}", pl);
@@ -51,10 +78,10 @@ pub async fn download(
         Err(e) => return Err(Error::Custom(format!("Parsing playlist error: {e}"))),
     };
     let mut previous_last_segment = 0;
+    let mut last_playlist_load = Instant::now();
     loop {
         if pl.segments.is_empty() {
-            info!("Segments array is empty - stream finished");
-            break;
+            debug!("Segments array is empty - waiting for playlist update");
         }
         let mut seq = pl.media_sequence;
         for segment in &pl.segments {
@@ -85,11 +112,23 @@ pub async fn download(
             }
             seq += 1;
         }
+
+        if !playlist_should_refresh(&pl) {
+            info!("#EXT-X-ENDLIST received - stream finished");
+            break;
+        }
+
+        let poll_interval = playlist_poll_interval(&pl);
+        let refresh_delay = poll_interval.saturating_sub(last_playlist_load.elapsed());
+        if !refresh_delay.is_zero() {
+            debug!("Waiting {refresh_delay:?} before refreshing media playlist");
+            tokio::time::sleep(refresh_delay).await;
+        }
+
         let resp = client.retryable(media_url.as_str()).await?;
         let bs = resp.bytes().await?;
-        if let Ok((_, playlist)) = m3u8_rs::parse_media_playlist(&bs) {
-            pl = playlist;
-        }
+        pl = parse_media_playlist(&bs)?;
+        last_playlist_load = Instant::now();
     }
     info!("Done...");
     Ok(())
@@ -155,7 +194,10 @@ impl Drop for TsFile<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::{parse_media_playlist, playlist_poll_interval, playlist_should_refresh};
+    use m3u8_rs::MediaPlaylist;
     use reqwest::Url;
+    use std::time::Duration;
 
     #[test]
     fn test_url() -> Result<(), Box<dyn std::error::Error>> {
@@ -172,5 +214,48 @@ mod tests {
         // download(
         //     "test.ts")?;
         Ok(())
+    }
+
+    #[test]
+    fn playlist_poll_interval_uses_target_duration() {
+        let playlist = MediaPlaylist {
+            target_duration: 6,
+            ..MediaPlaylist::default()
+        };
+
+        assert_eq!(playlist_poll_interval(&playlist), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn playlist_poll_interval_has_one_second_minimum() {
+        assert_eq!(
+            playlist_poll_interval(&MediaPlaylist::default()),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn parse_media_playlist_preserves_end_list() {
+        let playlist = parse_media_playlist(
+            b"#EXTM3U\n\
+              #EXT-X-TARGETDURATION:6\n\
+              #EXT-X-MEDIA-SEQUENCE:7\n\
+              #EXTINF:6.0,\n\
+              7.ts\n\
+              #EXT-X-ENDLIST\n",
+        )
+        .expect("valid media playlist should parse");
+
+        assert!(playlist.end_list);
+        assert!(!playlist_should_refresh(&playlist));
+        assert_eq!(playlist.segments.len(), 1);
+    }
+
+    #[test]
+    fn parse_media_playlist_returns_error_for_invalid_content() {
+        let error = parse_media_playlist(b"not a media playlist")
+            .expect_err("invalid media playlist should return an error");
+
+        assert!(error.to_string().contains("Unable to parse media playlist"));
     }
 }

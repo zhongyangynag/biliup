@@ -14,10 +14,12 @@ use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
 use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
-use biliup::uploader::line::{Line, Probe};
+use biliup::uploader::line::{Line, Probe, StreamParcel, UploadedStream};
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, line};
+use bytes::Bytes;
 use error_stack::ResultExt;
+use futures::Stream;
 use futures::StreamExt;
 use futures::stream::Inspect;
 use ormlite::Insert;
@@ -28,11 +30,12 @@ use tokio::pin;
 use tracing::{error, info};
 
 // 辅助结构体
-struct UploadContext {
-    bilibili: BiliBili,
-    line: Line,
-    threads: usize,
-    client: StatelessClient,
+#[derive(Clone)]
+pub(crate) struct UploadContext {
+    pub(crate) bilibili: BiliBili,
+    pub(crate) line: Line,
+    pub(crate) threads: usize,
+    pub(crate) client: StatelessClient,
 }
 
 #[derive(Default)]
@@ -87,7 +90,22 @@ where
     Ok(())
 }
 
-async fn initialize_upload_context(
+async fn process_without_upload<F>(
+    rx: Inspect<Receiver<SegmentInfo>, F>,
+    ctx: &Context,
+) -> AppResult<()>
+where
+    F: FnMut(&SegmentInfo),
+{
+    let mut paths = Vec::new();
+    pin!(rx);
+    while let Some(event) = rx.next().await {
+        paths.extend(segment_paths(&event));
+    }
+    execute_postprocessor(paths, ctx).await
+}
+
+pub(crate) async fn initialize_upload_context(
     config: &Config,
     client: &StatelessClient,
     upload_config: &UploadStreamer,
@@ -115,11 +133,12 @@ async fn initialize_upload_context(
 async fn get_upload_line(client: &reqwest::Client, line: &str) -> AppResult<Line> {
     let line = match line {
         "bda2" => line::bda2(),
-        "bda" => line::bda(),
         "tx" => line::tx(),
         "txa" => line::txa(),
         "bldsa" => line::bldsa(),
         "alia" => line::alia(),
+        "estx" => line::estx(),
+        "akbd" => line::akbd(),
         _ => Probe::probe(client).await.unwrap_or_default(),
     };
     Ok(line)
@@ -183,7 +202,10 @@ where
     Ok(uploaded)
 }
 
-async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {
+pub(crate) async fn upload_single_file(
+    file_path: &Path,
+    context: &UploadContext,
+) -> AppResult<Video> {
     let video_path = file_path;
     let UploadContext {
         bilibili,
@@ -256,6 +278,10 @@ pub async fn submit_to_bilibili(
             .submit_by_bcut_android(studio, None)
             .await
             .change_context(AppError::Unknown)?,
+        SubmitOption::Web => bilibili
+            .submit_by_web(studio, None)
+            .await
+            .change_context(AppError::Unknown)?,
         _ => bilibili
             .submit_by_app(studio, None)
             .await
@@ -263,6 +289,69 @@ pub async fn submit_to_bilibili(
     };
     info!("Submit successful");
     Ok(result)
+}
+
+pub async fn edit_to_bilibili(
+    bilibili: &BiliBili,
+    studio: &Studio,
+    submit_api: Option<&str>,
+) -> AppResult<serde_json::Value> {
+    let submit_option = match submit_api {
+        Some(submit) => SubmitOption::from_str(submit).unwrap_or(SubmitOption::App),
+        _ => SubmitOption::App,
+    };
+
+    let result = match submit_option {
+        SubmitOption::Web => bilibili
+            .edit_by_web(studio)
+            .await
+            .change_context(AppError::Unknown)?,
+        _ => bilibili
+            .edit_by_app(studio, None)
+            .await
+            .change_context(AppError::Unknown)?,
+    };
+    info!("Edit successful");
+    Ok(result)
+}
+
+pub(crate) fn aid_from_submit(ret: &ResponseData) -> AppResult<u64> {
+    ret.data
+        .as_ref()
+        .and_then(|v| v.get("aid"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+        .ok_or_else(|| AppError::Custom("投稿成功但未返回 aid".into()).into())
+}
+
+/// 边录边传：把内存分片流上传到 UPOS。上传并发固定为 3，对齐原 sync-downloader。
+pub(crate) async fn upload_byte_stream_parts<S>(
+    context: &UploadContext,
+    parcel: StreamParcel,
+    stream: S,
+) -> AppResult<UploadedStream>
+where
+    S: Stream<Item = biliup::error::Result<(Bytes, usize)>>,
+{
+    let file_name = parcel.file_name().to_string();
+    let total_size = parcel.total_size();
+    info!("开始流式上传：{file_name} ({total_size} bytes)");
+    info!("线路选择：{:?}", context.line);
+    let instant = Instant::now();
+    let uploaded = parcel
+        .upload_parts(context.client.clone(), 3, stream)
+        .await
+        .change_context(AppError::Unknown)?;
+    let t = instant.elapsed().as_millis().max(1);
+    info!(
+        "Stream parts uploaded: {file_name} => cost {:.2}s, {:.2} MB/s.",
+        t as f64 / 1000.,
+        uploaded.uploaded_size() as f64 / 1000. / t as f64
+    );
+    Ok(uploaded)
+}
+
+pub(crate) async fn complete_byte_stream(uploaded: UploadedStream) -> AppResult<Video> {
+    uploaded.complete().await.change_context(AppError::Unknown)
 }
 
 // 解析投稿的「转载来源」(source) 字段。
@@ -295,7 +384,7 @@ pub(crate) async fn build_studio(
         ))
         .tag(upload_config.tags.join(","))
         .maybe_tid(upload_config.tid)
-        .title(recorder.format_filename())
+        .title(recorder.format_title())
         .videos(videos)
         .dolby(upload_config.dolby.unwrap_or_default())
         // .lossless_music(upload_config.)
@@ -363,9 +452,10 @@ pub async fn upload(
         Some(UploadLine::Cntx) => line::cntx(),
         Some(UploadLine::Antx) => line::antx(),
         Some(UploadLine::Attx) => line::attx(),
-        // Some(UploadLine::Bda) => line::bda(),
         Some(UploadLine::Txa) => line::txa(),
         Some(UploadLine::Alia) => line::alia(),
+        Some(UploadLine::Estx) => line::estx(),
+        Some(UploadLine::Akbd) => line::akbd(),
         _ => Probe::probe(&client.client).await.unwrap_or_default(),
     };
     for video_path in video_paths {
@@ -458,6 +548,30 @@ mod tests {
             "https://b23.tv/abc"
         );
     }
+
+    #[test]
+    fn aid_from_submit_reads_numeric_aid() {
+        let ret: ResponseData = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {"aid": 12345, "bvid": "BV1xx"},
+            "message": "0",
+            "ttl": 1
+        }))
+        .unwrap();
+        assert_eq!(aid_from_submit(&ret).unwrap(), 12345);
+    }
+
+    #[test]
+    fn aid_from_submit_rejects_missing_data() {
+        let ret: ResponseData = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {},
+            "message": "0",
+            "ttl": 1
+        }))
+        .unwrap();
+        assert!(aid_from_submit(&ret).is_err());
+    }
 }
 
 /// 上传Actor
@@ -504,6 +618,13 @@ impl UActor {
                     });
                 });
                 let result = match ctx.upload_config() {
+                    Some(config) if config.is_noop_uploader() => {
+                        info!(
+                            uploader = ?config.uploader,
+                            "Skipping upload because uploader is Noop"
+                        );
+                        process_without_upload(inspect, &ctx).await
+                    }
                     Some(config) => process_with_upload(inspect, &ctx, config).await,
                     None => {
                         let mut paths = Vec::new();

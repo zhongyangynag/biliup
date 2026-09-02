@@ -12,9 +12,13 @@ use struct_patch::Patch;
 #[patch(attribute(derive(Debug, Clone, Default, Deserialize, Serialize)))]
 pub struct Config {
     // ===== 全局录播与上传设置 =====
-    /// 下载器类型：streamlink | ffmpeg | stream-gears | 自定义
+    /// 下载器类型：streamlink | ffmpeg | stream-gears | sync-downloader | 自定义
     #[serde(default)]
     pub downloader: Option<DownloaderType>,
+
+    /// 边录边传额外保存本地目录（仅 sync-downloader）
+    #[serde(default)]
+    pub sync_save_dir: Option<String>,
 
     /// 文件大小限制（字节）
     #[patch(attribute(serde(default, deserialize_with = "deserialize_option_patch")))]
@@ -46,7 +50,7 @@ pub struct Config {
     #[serde(default)]
     pub submit_api: Option<String>,
 
-    /// 上传线路：AUTO | alia | bda2 | bldsa | qn | tx | txa
+    /// 上传线路：AUTO | alia | bda2 | bldsa | tx | txa | estx | akbd
     #[builder(default = default_lines())]
     #[serde(default = "default_lines")]
     pub lines: String,
@@ -90,6 +94,9 @@ pub struct Config {
     /// 斗鱼CDN节点
     #[serde(default)]
     pub douyu_cdn: Option<String>,
+    /// 斗鱼强制 hs 流使用构造链接
+    #[serde(default)]
+    pub douyu_force_hs: Option<bool>,
     /// 斗鱼弹幕录制
     #[serde(default)]
     pub douyu_danmaku: Option<bool>,
@@ -119,6 +126,9 @@ pub struct Config {
     /// 虎牙是否保留 imgplus 流名
     #[serde(default)]
     pub huya_imgplus: Option<bool>,
+    /// 虎牙走小程序 API 获取房间信息
+    #[serde(default)]
+    pub huya_mobile_api: Option<bool>,
     /// 虎牙编码参数
     #[serde(default)]
     pub huya_codec: Option<String>,
@@ -605,5 +615,17 @@ mod tests {
         assert_eq!(config.file_size, None);
         assert_eq!(config.segment_time, Some("01:00:00".to_string()));
         assert!(config.validate_segment_limits().is_ok());
+    }
+
+    #[test]
+    fn deserialize_sync_save_dir() {
+        let config: Config =
+            serde_json::from_str(r#"{"sync_save_dir":"/tmp/sync","downloader":"sync-downloader"}"#)
+                .unwrap();
+        assert_eq!(config.sync_save_dir.as_deref(), Some("/tmp/sync"));
+        assert_eq!(config.downloader, Some(DownloaderType::SyncDownloader));
+
+        let empty: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(empty.sync_save_dir, None);
     }
 }
